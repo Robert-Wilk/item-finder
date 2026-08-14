@@ -24,7 +24,7 @@ TODO before running:
     ultrasonic range if that's a more reliable "close enough" signal
     for your setup) against real test runs.
   - Confirm /range topic name/type matches your existing ultrasonic node
-    if you wire it in below (optional, currently unused by this file --
+    if you wire it in below (optional, currently unused by this file -
     safety_node already handles hard-stop independently).
 """
 

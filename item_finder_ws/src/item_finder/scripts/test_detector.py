@@ -1,116 +1,114 @@
 #!/usr/bin/env python3
 """
-Run this FIRST, before wiring anything into ROS 2.
+Run this FIRST, before wiring perception_node into the full launch file.
 
-Points the Pi camera (or a USB webcam / a folder of test photos) at your
-actual demo objects and checks the detector actually sees them reliably.
-This is the highest-risk unknown in the whole build - find out early
-whether your target objects are being detected consistently, or whether
-you need to narrow your TARGET_CLASSES list.
+Subscribes to the SAME /image_raw topic your real camera_node already
+publishes (rather than opening the camera device directly), so this:
+  - avoids device-contention errors (cv2.VideoCapture fighting your
+    already-running camera_node for the same /dev/video device)
+  - tests the exact same data path perception_node will actually use
+
+Requires your base robot's camera_node to already be running and
+publishing /image_raw (confirm with `ros2 topic list`).
 
 Usage:
-  python3 scripts/test_detector.py --source 0        # webcam/picam index
-  python3 scripts/test_detector.py --source photo.jpg # single image
-  python3 scripts/test_detector.py --source ./test_photos/  # folder
+  python3 scripts/test_detector.py                      # default /image_raw, live loop
+  python3 scripts/test_detector.py --topic /image_raw
+  python3 scripts/test_detector.py --frames 20           # stop after N frames instead of running forever
+  python3 scripts/test_detector.py --save                # save annotated frames to ./test_output/
 """
 
 import argparse
-import glob
 import os
 import time
 
 import cv2
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
 from ultralytics import YOLO
 
 from item_finder.target_classes import TARGET_CLASSES
 
 
-def run_on_frame(model, frame, conf_thresh):
-    t0 = time.time()
-    results = model.predict(frame, imgsz=320, conf=conf_thresh, verbose=False)
-    dt = time.time() - t0
+class DetectorTestNode(Node):
+    def __init__(self, topic, model_path, conf_thresh, max_frames, save):
+        super().__init__('detector_test_node')
+        self.bridge = CvBridge()
+        self.conf_thresh = conf_thresh
+        self.max_frames = max_frames
+        self.save = save
+        self.frame_count = 0
 
-    r = results[0]
-    found = []
-    for box in r.boxes:
-        cls_id = int(box.cls[0])
-        name = model.names[cls_id]
-        conf = float(box.conf[0])
-        found.append((name, conf))
+        if self.save:
+            os.makedirs('test_output', exist_ok=True)
 
-    target_hits = [f for f in found if f[0] in TARGET_CLASSES]
-    other = [f for f in found if f[0] not in TARGET_CLASSES]
+        self.get_logger().info(f'Loading {model_path} ...')
+        self.model = YOLO(model_path)
+        self.get_logger().info(f'Target classes to verify: {TARGET_CLASSES}')
+        self.get_logger().info(f'Subscribing to {topic} - waiting for frames...')
 
-    print(f'  inference time: {dt*1000:.0f} ms')
-    if target_hits:
-        print(f'  TARGET matches: {target_hits}')
-    else:
-        print('  no target-class matches')
-    if other:
-        print(f'  other detections: {other}')
+        self.create_subscription(Image, topic, self.on_image, 1)
 
-    return r.plot()  # annotated frame, for optional visual check
+    def on_image(self, msg: Image):
+        t_recv = time.time()
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().warn(f'cv_bridge conversion failed: {e}')
+            return
+
+        t0 = time.time()
+        results = self.model.predict(frame, imgsz=320, conf=self.conf_thresh, verbose=False)
+        dt = time.time() - t0
+
+        r = results[0]
+        found = []
+        for box in r.boxes:
+            cls_id = int(box.cls[0])
+            name = self.model.names[cls_id]
+            conf = float(box.conf[0])
+            found.append((name, round(conf, 2)))
+
+        target_hits = [f for f in found if f[0] in TARGET_CLASSES]
+        other = [f for f in found if f[0] not in TARGET_CLASSES]
+
+        print(f'\n--- frame {self.frame_count} ---')
+        print(f'  inference time: {dt*1000:.0f} ms')
+        print(f'  TARGET matches: {target_hits}' if target_hits else '  no target-class matches')
+        if other:
+            print(f'  other detections: {other}')
+
+        if self.save:
+            annotated = r.plot()
+            cv2.imwrite(os.path.join('test_output', f'frame_{self.frame_count:04d}.jpg'), annotated)
+
+        self.frame_count += 1
+        if self.max_frames and self.frame_count >= self.max_frames:
+            self.get_logger().info(f'Reached {self.max_frames} frames, shutting down.')
+            rclpy.shutdown()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--source', default='0', help='camera index, image path, or folder')
+    parser.add_argument('--topic', default='/image_raw')
     parser.add_argument('--model', default='yolov8n.pt')
     parser.add_argument('--conf', type=float, default=0.45)
-    parser.add_argument('--save-annotated', action='store_true',
-                         help='save annotated frames to ./test_output/')
+    parser.add_argument('--frames', type=int, default=0, help='stop after N frames (0 = run forever)')
+    parser.add_argument('--save', action='store_true')
     args = parser.parse_args()
 
-    print(f'Loading {args.model} ...')
-    model = YOLO(args.model)
-    print(f'Target classes to verify: {TARGET_CLASSES}\n')
-
-    if args.save_annotated:
-        os.makedirs('test_output', exist_ok=True)
-
-    # Folder of images
-    if os.path.isdir(args.source):
-        paths = sorted(glob.glob(os.path.join(args.source, '*')))
-        for p in paths:
-            frame = cv2.imread(p)
-            if frame is None:
-                continue
-            print(f'--- {p} ---')
-            annotated = run_on_frame(model, frame, args.conf)
-            if args.save_annotated:
-                cv2.imwrite(os.path.join('test_output', os.path.basename(p)), annotated)
-        return
-
-    # Single image file
-    if os.path.isfile(args.source):
-        frame = cv2.imread(args.source)
-        print(f'--- {args.source} ---')
-        annotated = run_on_frame(model, frame, args.conf)
-        if args.save_annotated:
-            cv2.imwrite(os.path.join('test_output', 'result.jpg'), annotated)
-        return
-
-    # Live camera (index)
-    cam_index = int(args.source)
-    cap = cv2.VideoCapture(cam_index)
-    print('Press Ctrl+C to stop.\n')
-    frame_no = 0
+    rclpy.init()
+    node = DetectorTestNode(args.topic, args.model, args.conf, args.frames, args.save)
     try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                print('Failed to read frame.')
-                break
-            print(f'--- frame {frame_no} ---')
-            annotated = run_on_frame(model, frame, args.conf)
-            if args.save_annotated:
-                cv2.imwrite(os.path.join('test_output', f'frame_{frame_no:04d}.jpg'), annotated)
-            frame_no += 1
-            time.sleep(0.5)  # don't hammer the CPU while eyeballing results
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        cap.release()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
