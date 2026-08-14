@@ -25,6 +25,7 @@ import time
 import cv2
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from ultralytics import YOLO
@@ -49,7 +50,7 @@ class DetectorTestNode(Node):
         self.get_logger().info(f'Target classes to verify: {TARGET_CLASSES}')
         self.get_logger().info(f'Subscribing to {topic} - waiting for frames...')
 
-        self.create_subscription(Image, topic, self.on_image, 1)
+        self.create_subscription(Image, topic, self.on_image, qos_profile_sensor_data)
 
     def on_image(self, msg: Image):
         t_recv = time.time()

@@ -24,6 +24,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
@@ -65,7 +66,7 @@ class PerceptionNode(Node):
         self.detections_pub = self.create_publisher(String, '/detections', 10)
 
         self.image_sub = self.create_subscription(
-            Image, image_topic, self.on_image, 1  # depth=1: always want the latest frame
+            Image, image_topic, self.on_image, qos_profile_sensor_data
         )
 
         self.get_logger().info(

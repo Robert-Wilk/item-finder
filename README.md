@@ -72,7 +72,7 @@ source install/setup.bash
 
 ### 4. Verify the detector against your objects (do this before anything else)
 ```bash
-python3 src/item_finder/scripts/test_detector.py --source 0
+python3 src/item_finder/scripts/test_detector.py --frames 20
 ```
 
 ### 5. Launch
