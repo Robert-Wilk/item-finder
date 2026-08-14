@@ -3,19 +3,20 @@
 Run this FIRST, before wiring perception_node into the full launch file.
 
 Subscribes to the SAME /image_raw topic your real camera_node already
-publishes (rather than opening the camera device directly), so this:
-  - avoids device-contention errors (cv2.VideoCapture fighting your
-    already-running camera_node for the same /dev/video device)
-  - tests the exact same data path perception_node will actually use
+publishes, using the SAME tflite-runtime backend as perception_node
+(pre-quantized SSD MobileNet, not PyTorch -- see perception_node.py's
+docstring for why: full PyTorch's memory footprint doesn't reliably
+fit a Pi 3B+'s ~899MB usable RAM alongside your other running nodes).
 
-Requires your base robot's camera_node to already be running and
-publishing /image_raw (confirm with `ros2 topic list`).
+Requires:
+  - Your base robot's camera_node already running and publishing /image_raw
+  - Model downloaded into src/item_finder/models/ (see README)
+  - pip install tflite-runtime --break-system-packages
 
 Usage:
-  python3 scripts/test_detector.py                      # default /image_raw, live loop
-  python3 scripts/test_detector.py --topic /image_raw
-  python3 scripts/test_detector.py --frames 20           # stop after N frames instead of running forever
-  python3 scripts/test_detector.py --save                # save annotated frames to ./test_output/
+  python3 scripts/test_detector.py
+  python3 scripts/test_detector.py --frames 20
+  python3 scripts/test_detector.py --conf 0.3
 """
 
 import argparse
@@ -23,54 +24,77 @@ import os
 import time
 
 import cv2
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
-from ultralytics import YOLO
+
+try:
+    import tflite_runtime.interpreter as tflite
+except ImportError:
+    import tensorflow.lite as tflite
 
 from item_finder.target_classes import TARGET_CLASSES
 
+MODEL_INPUT_SIZE = 300
+
+
+def load_labels(path):
+    with open(path, 'r') as f:
+        return [line.strip() for line in f.readlines()]
+
 
 class DetectorTestNode(Node):
-    def __init__(self, topic, model_path, conf_thresh, max_frames, save):
+    def __init__(self, topic, model_path, labels_path, conf_thresh, max_frames):
         super().__init__('detector_test_node')
         self.bridge = CvBridge()
         self.conf_thresh = conf_thresh
         self.max_frames = max_frames
-        self.save = save
         self.frame_count = 0
 
-        if self.save:
-            os.makedirs('test_output', exist_ok=True)
+        self.get_logger().info(f'Loading TFLite model: {model_path} ...')
+        self.interpreter = tflite.Interpreter(model_path=model_path)
+        self.interpreter.allocate_tensors()
+        self.input_details = self.interpreter.get_input_details()
+        self.output_details = self.interpreter.get_output_details()
+        self.labels = load_labels(labels_path)
 
-        self.get_logger().info(f'Loading {model_path} ...')
-        self.model = YOLO(model_path)
         self.get_logger().info(f'Target classes to verify: {TARGET_CLASSES}')
-        self.get_logger().info(f'Subscribing to {topic} - waiting for frames...')
+        self.get_logger().info(f'Subscribing to {topic} -- waiting for frames...')
 
         self.create_subscription(Image, topic, self.on_image, qos_profile_sensor_data)
 
     def on_image(self, msg: Image):
-        t_recv = time.time()
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
         except Exception as e:
             self.get_logger().warn(f'cv_bridge conversion failed: {e}')
             return
 
         t0 = time.time()
-        results = self.model.predict(frame, imgsz=320, conf=self.conf_thresh, verbose=False)
+        resized = cv2.resize(frame, (MODEL_INPUT_SIZE, MODEL_INPUT_SIZE))
+        input_data = np.expand_dims(resized, axis=0).astype(np.uint8)
+
+        self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
+        self.interpreter.invoke()
+
+        boxes = self.interpreter.get_tensor(self.output_details[0]['index'])[0]
+        classes = self.interpreter.get_tensor(self.output_details[1]['index'])[0]
+        scores = self.interpreter.get_tensor(self.output_details[2]['index'])[0]
+        num_detections = int(self.interpreter.get_tensor(self.output_details[3]['index'])[0])
         dt = time.time() - t0
 
-        r = results[0]
         found = []
-        for box in r.boxes:
-            cls_id = int(box.cls[0])
-            name = self.model.names[cls_id]
-            conf = float(box.conf[0])
-            found.append((name, round(conf, 2)))
+        for i in range(num_detections):
+            score = float(scores[i])
+            if score < self.conf_thresh:
+                continue
+            class_id = int(classes[i])
+            if class_id < 0 or class_id >= len(self.labels):
+                continue
+            found.append((self.labels[class_id], round(score, 2)))
 
         target_hits = [f for f in found if f[0] in TARGET_CLASSES]
         other = [f for f in found if f[0] not in TARGET_CLASSES]
@@ -81,10 +105,6 @@ class DetectorTestNode(Node):
         if other:
             print(f'  other detections: {other}')
 
-        if self.save:
-            annotated = r.plot()
-            cv2.imwrite(os.path.join('test_output', f'frame_{self.frame_count:04d}.jpg'), annotated)
-
         self.frame_count += 1
         if self.max_frames and self.frame_count >= self.max_frames:
             self.get_logger().info(f'Reached {self.max_frames} frames, shutting down.')
@@ -92,16 +112,20 @@ class DetectorTestNode(Node):
 
 
 def main():
+    pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    default_model = os.path.join(pkg_dir, 'models', 'detect.tflite')
+    default_labels = os.path.join(pkg_dir, 'models', 'labelmap.txt')
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--topic', default='/image_raw')
-    parser.add_argument('--model', default='yolov8n.pt')
-    parser.add_argument('--conf', type=float, default=0.45)
+    parser.add_argument('--model', default=default_model)
+    parser.add_argument('--labels', default=default_labels)
+    parser.add_argument('--conf', type=float, default=0.5)
     parser.add_argument('--frames', type=int, default=0, help='stop after N frames (0 = run forever)')
-    parser.add_argument('--save', action='store_true')
     args = parser.parse_args()
 
     rclpy.init()
-    node = DetectorTestNode(args.topic, args.model, args.conf, args.frames, args.save)
+    node = DetectorTestNode(args.topic, args.model, args.labels, args.conf, args.frames)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
