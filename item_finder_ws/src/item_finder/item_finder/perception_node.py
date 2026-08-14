@@ -28,6 +28,8 @@ TODO before running:
     ACTUAL demo objects before trusting this in the full pipeline.
 """
 
+from ament_index_python.packages import get_package_share_directory
+
 import json
 import os
 import time
@@ -71,10 +73,14 @@ class PerceptionNode(Node):
     def __init__(self):
         super().__init__('perception_node')
 
-        pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        default_model = os.path.join(pkg_dir, 'models', 'detect.tflite')
-        default_labels = os.path.join(pkg_dir, 'models', 'labelmap.txt')
-
+        pkg_dir = get_package_share_directory('item_finder')
+        default_model = os.path.join(
+            pkg_dir, 'models', 'detect.tflite'
+        )
+        default_labels = os.path.join(
+            pkg_dir, 'models', 'labelmap.txt'
+        )
+        
         self.declare_parameter('image_topic', '/image_raw')
         self.declare_parameter('model_path', default_model)
         self.declare_parameter('labels_path', default_labels)
